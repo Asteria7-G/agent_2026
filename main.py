@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from data_extraction_tool import *
 
+# os.environ["AZURE_OPENAI_API_KEY"] = "a72b7770afac45d6ba000394ddde7151"
+
 app = FastAPI(title='Digital_SE_Q_Q')
 app.add_middleware(
             CORSMiddleware,
@@ -46,6 +48,11 @@ class GetAnswerFromKG2026(BaseModel):
 # POST 接口：返回 task_id 并启动后台 Agent
 @agent_2026_router.post("/api/digital_se/KG/answer_from_agent_2026/",tags=['agent2026'])
 async def post_answer_from_kg(item: GetAnswerFromKG2026, background_tasks: BackgroundTasks):
+    """
+        demo: {user_question:"0437CX001F有哪些测试步骤和参数？"}
+
+        return
+        """
     task_id = str(uuid.uuid4())
     background_tasks.add_task(run_agent, task_id, item.user_question)
     return {"status": 1, "result": {"connectionID": task_id}}

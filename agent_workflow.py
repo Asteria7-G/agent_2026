@@ -100,13 +100,13 @@ def execute_gql_tool(gql: str) -> Dict[str, Any]:
 
 def _load_llm() -> AzureChatOpenAI:
     return AzureChatOpenAI(
-        deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5"),
-        temperature=0,
+        deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+        temperature=1,
         azure_endpoint=os.getenv(
             "AZURE_OPENAI_ENDPOINT", "https://openaichatgpt-me-cn.openai.azure.com/"
         ),
         openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
-        openai_api_key=os.getenv("AZURE_OPENAI_API_KEY", ""),
+        openai_api_key=os.getenv("AZURE_OPENAI_API_KEY", "a72b7770afac45d6ba000394ddde7151"),
     )
 
 
