@@ -223,6 +223,37 @@ LIMIT 5;
     )
 
 
+def _build_index_not_found_hint(gql: str, error_msg: str) -> str:
+    """针对 Nebula IndexNotFound 给出可执行建议。"""
+    hint_lines = [f"查询失败：{error_msg}"]
+    hint_lines.append("检测到图查询缺少可用索引，MATCH/WHERE 属性过滤通常需要索引支持。")
+
+    # 尝试提取类似 `(p:PN)` + `p.code` 的模式，给出更具体的建索引建议
+    alias_tag = {}
+    for alias, tag in re.findall(r"\(\s*([a-zA-Z_]\w*)\s*:\s*([A-Za-z_]\w*)\s*\)", gql):
+        alias_tag[alias] = tag
+
+    suggested = []
+    for alias, prop in re.findall(r"\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b", gql):
+        tag = alias_tag.get(alias)
+        if tag:
+            idx_name = f"idx_{tag.lower()}_{prop.lower()}"
+            suggested.append((idx_name, tag, prop))
+
+    if suggested:
+        hint_lines.append("可参考以下索引命令（由当前查询自动推断）：")
+        for idx_name, tag, prop in sorted(set(suggested)):
+            hint_lines.append(
+                f"- CREATE TAG INDEX IF NOT EXISTS {idx_name} ON {tag}({prop}(128));"
+            )
+            hint_lines.append(f"- REBUILD TAG INDEX {idx_name};")
+    else:
+        hint_lines.append("请在查询涉及的 Tag 属性上创建并重建索引后重试。")
+
+    hint_lines.append("索引生效后再重试当前问题。")
+    return "\n".join(hint_lines)
+
+
 def _extract_graph_payload(rows: List[Dict[str, str]]) -> Dict[str, Any]:
     """根据查询结果尽量构造前端可视化子图结构。"""
     nodes = {}
@@ -329,6 +360,10 @@ Schema: {state['schema']}
                 nebula_result = execute_gql_tool.invoke({"gql": state["gql"]})
 
         if nebula_result.get("error"):
+            if "IndexNotFound" in nebula_result["error"]:
+                hint = _build_index_not_found_hint(state["gql"], nebula_result["error"])
+                await _send_ws_message(task_id, "text", hint, 1)
+                return
             await _send_ws_message(task_id, "text", f"查询失败：{nebula_result['error']}", 1)
             return
 
