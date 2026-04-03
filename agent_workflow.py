@@ -268,9 +268,15 @@ async def _send_ws_message(task_id: str, category: str, message: str, response_e
     await websocket_client(payload)
 
 
+async def _send_progress(task_id: str, message: str):
+    """发送过程进度（非模型思维链，仅阶段状态）。"""
+    await _send_ws_message(task_id, "text", f"[进度] {message}", 0)
+
+
 async def run_agent(task_id: str, user_question: str):
     try:
         state: Dict[str, Any] = {"user_question": user_question}
+        await _send_progress(task_id, "正在读取图谱 schema...")
         state["schema"] = get_nebula_schema_tool.invoke({})
 
         if state["schema"].get("error"):
@@ -289,6 +295,7 @@ async def run_agent(task_id: str, user_question: str):
 
 只返回 JSON 对象。
 """
+        await _send_progress(task_id, "正在解析问题意图...")
         resp = llm.invoke([HumanMessage(content=prompt_understand)])
         try:
             state["structured_query"] = _safe_json_loads(resp.content)
@@ -305,14 +312,17 @@ Schema: {state['schema']}
 用户意图: {state['structured_query']}
 只返回一条可执行的 GQL 语句，不要附加解释。
 """
+        await _send_progress(task_id, "正在生成 GQL...")
         resp_gql = llm.invoke([HumanMessage(content=prompt_gql)])
         state["gql"] = _strip_code_fence(_normalize_llm_content(resp_gql.content))
+        await _send_progress(task_id, "正在执行 GQL 查询...")
 
         nebula_result = execute_gql_tool.invoke({"gql": state["gql"]})
         if (
             nebula_result.get("error")
             and "Only column name can be used as sort item" in nebula_result["error"]
         ):
+            await _send_progress(task_id, "检测到 ORDER BY 语义限制，正在自动重试...")
             fallback_gql = _strip_order_by_clause(state["gql"])
             if fallback_gql and fallback_gql != state["gql"]:
                 state["gql"] = fallback_gql
@@ -324,6 +334,7 @@ Schema: {state['schema']}
 
         # 结果为空时，尝试把文档下游关系改为 OPTIONAL MATCH，减少“任一分支无数据即全空”的情况
         if not nebula_result.get("rows"):
+            await _send_progress(task_id, "首次查询为空，正在放宽关系匹配并重试...")
             relaxed_gql = _relax_document_optional_match(state["gql"])
             if relaxed_gql != state["gql"]:
                 retry_result = execute_gql_tool.invoke({"gql": relaxed_gql})
@@ -336,11 +347,14 @@ Schema: {state['schema']}
             "columns": list(nebula_result["rows"][0].keys()) if nebula_result["rows"] else [],
             "rows": nebula_result["rows"],
         }
+        await _send_progress(task_id, "正在构建子图数据...")
         state["subgraph"] = build_subgraph_tool.invoke({"rows": nebula_result["rows"]})
 
         if not nebula_result["rows"]:
+            await _send_progress(task_id, "结果为空，正在生成诊断说明...")
             state["summary"] = _build_empty_result_hint(state["gql"])
         else:
+            await _send_progress(task_id, "正在生成结果总结...")
             prompt_summary = (
                 "根据以下数据生成简洁中文总结，不逐行复述：\n"
                 f"{state['table_data']}"
