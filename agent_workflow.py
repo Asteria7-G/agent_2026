@@ -113,13 +113,60 @@ def _load_llm() -> AzureChatOpenAI:
 llm = _load_llm()
 
 
-def _safe_json_loads(raw: str) -> Dict[str, Any]:
-    """兼容 LLM 返回 ```json ... ``` 包裹的场景。"""
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\\s*", "", text)
-        text = re.sub(r"\\s*```$", "", text)
-    return json.loads(text)
+def _normalize_llm_content(content: Any) -> str:
+    """兼容不同模型返回格式，统一提取为文本。"""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                txt = item.get("text") or item.get("content") or ""
+                if txt:
+                    parts.append(str(txt))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+
+    return str(content)
+
+
+def _strip_code_fence(text: str) -> str:
+    """去掉 ```json ... ``` 或 ``` ... ``` 包裹。"""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _safe_json_loads(raw: Any) -> Dict[str, Any]:
+    """兼容 markdown fence，并尽量从文本中提取 JSON 对象。"""
+    text = _strip_code_fence(_normalize_llm_content(raw))
+    if not text:
+        raise ValueError("模型返回为空，无法解析 JSON")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            return json.loads(match.group(0))
+        raise ValueError(f"模型未返回合法 JSON：{text[:120]}")
+
+
+def _strip_order_by_clause(gql: str) -> str:
+    """Nebula 某些场景 ORDER BY 只能跟列名，失败时做一次降级重试。"""
+    # 去掉 ORDER BY ... [LIMIT n]
+    pattern = re.compile(
+        r"(?is)\s+ORDER\s+BY\s+[\s\S]*?(?=(\s+LIMIT\b|\s*;?\s*$))"
+    )
+    rewritten = re.sub(pattern, " ", gql).strip()
+    rewritten = re.sub(r"\s{2,}", " ", rewritten)
+    return rewritten
 
 
 def _extract_graph_payload(rows: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -189,7 +236,14 @@ async def run_agent(task_id: str, user_question: str):
 只返回 JSON 对象。
 """
         resp = llm.invoke([HumanMessage(content=prompt_understand)])
-        state["structured_query"] = _safe_json_loads(resp.content)
+        try:
+            state["structured_query"] = _safe_json_loads(resp.content)
+        except ValueError:
+            state["structured_query"] = {
+                "intent": "graph_query",
+                "question": state["user_question"],
+                "note": _normalize_llm_content(resp.content)[:200],
+            }
 
         prompt_gql = f"""
 根据用户意图和 schema 生成 Nebula GQL 查询：
@@ -198,9 +252,18 @@ Schema: {state['schema']}
 只返回一条可执行的 GQL 语句，不要附加解释。
 """
         resp_gql = llm.invoke([HumanMessage(content=prompt_gql)])
-        state["gql"] = resp_gql.content.strip().strip("`")
+        state["gql"] = _strip_code_fence(_normalize_llm_content(resp_gql.content))
 
         nebula_result = execute_gql_tool.invoke({"gql": state["gql"]})
+        if (
+            nebula_result.get("error")
+            and "Only column name can be used as sort item" in nebula_result["error"]
+        ):
+            fallback_gql = _strip_order_by_clause(state["gql"])
+            if fallback_gql and fallback_gql != state["gql"]:
+                state["gql"] = fallback_gql
+                nebula_result = execute_gql_tool.invoke({"gql": state["gql"]})
+
         if nebula_result.get("error"):
             await _send_ws_message(task_id, "text", f"查询失败：{nebula_result['error']}", 1)
             return
@@ -218,7 +281,7 @@ Schema: {state['schema']}
             f"{state['table_data']}"
         )
         resp_sum = llm.invoke([HumanMessage(content=prompt_summary)])
-        state["summary"] = resp_sum.content
+        state["summary"] = _normalize_llm_content(resp_sum.content)
 
         await _send_ws_message(
             task_id,
