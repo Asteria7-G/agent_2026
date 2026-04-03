@@ -169,6 +169,60 @@ def _strip_order_by_clause(gql: str) -> str:
     return rewritten
 
 
+def _relax_document_optional_match(gql: str) -> str:
+    """当步骤/检查项是强制 MATCH 导致空结果时，降级为 OPTIONAL MATCH 重试。"""
+    rewritten = gql
+    rewritten = re.sub(
+        r"(?i)\bMATCH\s*\(\s*d\s*\)\s*-\s*\[\s*:\s*document_record_test_operation_step\s*\]\s*->",
+        "OPTIONAL MATCH (d)-[:document_record_test_operation_step]->",
+        rewritten,
+    )
+    rewritten = re.sub(
+        r"(?i)\bMATCH\s*\(\s*d\s*\)\s*-\s*\[\s*:\s*document_has_test_check_items\s*\]\s*->",
+        "OPTIONAL MATCH (d)-[:document_has_test_check_items]->",
+        rewritten,
+    )
+    return rewritten
+
+
+def _extract_pn_code_from_gql(gql: str) -> str:
+    match = re.search(r"""p\.code\s*={1,2}\s*['"]([^'"]+)['"]""", gql, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _build_empty_result_hint(gql: str) -> str:
+    """基于真实检查查询，避免 LLM 幻觉建议。"""
+    pn_code = _extract_pn_code_from_gql(gql)
+    if not pn_code:
+        return "未查到匹配数据。可提供更完整的 PN/文档信息后重试。"
+
+    pn_rs = execute_gql(
+        f"""MATCH (p:PN) WHERE p.code == "{pn_code}" RETURN p.code AS pn_code LIMIT 1;"""
+    )
+    if pn_rs.get("error"):
+        return f"未查到匹配数据，且诊断查询失败：{pn_rs['error']}"
+    if not pn_rs.get("rows"):
+        return f"未查到匹配数据：PN `{pn_code}` 在图中不存在或编码不一致。"
+
+    doc_rs = execute_gql(
+        f"""
+MATCH (p:PN)-[:pn_reference_document]->(d:PRV_DOCUMENT)
+WHERE p.code == "{pn_code}"
+RETURN d.document_id AS document_id, d.document_name AS document_name, d.version AS version
+LIMIT 5;
+""".strip()
+    )
+    if doc_rs.get("error"):
+        return f"PN `{pn_code}` 存在，但查询关联文档失败：{doc_rs['error']}"
+    if not doc_rs.get("rows"):
+        return f"PN `{pn_code}` 存在，但未关联 PRV_DOCUMENT。"
+
+    return (
+        f"PN `{pn_code}` 存在，且已关联文档（示例 {len(doc_rs['rows'])} 条），"
+        "但当前组合条件未命中步骤/检查项。建议改为 OPTIONAL MATCH 或放宽筛选条件。"
+    )
+
+
 def _extract_graph_payload(rows: List[Dict[str, str]]) -> Dict[str, Any]:
     """根据查询结果尽量构造前端可视化子图结构。"""
     nodes = {}
@@ -268,6 +322,15 @@ Schema: {state['schema']}
             await _send_ws_message(task_id, "text", f"查询失败：{nebula_result['error']}", 1)
             return
 
+        # 结果为空时，尝试把文档下游关系改为 OPTIONAL MATCH，减少“任一分支无数据即全空”的情况
+        if not nebula_result.get("rows"):
+            relaxed_gql = _relax_document_optional_match(state["gql"])
+            if relaxed_gql != state["gql"]:
+                retry_result = execute_gql_tool.invoke({"gql": relaxed_gql})
+                if not retry_result.get("error") and retry_result.get("rows"):
+                    state["gql"] = relaxed_gql
+                    nebula_result = retry_result
+
         state["table_data"] = {
             "gql": state["gql"],
             "columns": list(nebula_result["rows"][0].keys()) if nebula_result["rows"] else [],
@@ -275,13 +338,15 @@ Schema: {state['schema']}
         }
         state["subgraph"] = build_subgraph_tool.invoke({"rows": nebula_result["rows"]})
 
-        prompt_summary = (
-            "根据以下数据生成简洁中文总结，不逐行复述。"
-            "如果 rows 为空，明确告知未查到匹配数据，并给出可尝试的查询方向：\n"
-            f"{state['table_data']}"
-        )
-        resp_sum = llm.invoke([HumanMessage(content=prompt_summary)])
-        state["summary"] = _normalize_llm_content(resp_sum.content)
+        if not nebula_result["rows"]:
+            state["summary"] = _build_empty_result_hint(state["gql"])
+        else:
+            prompt_summary = (
+                "根据以下数据生成简洁中文总结，不逐行复述：\n"
+                f"{state['table_data']}"
+            )
+            resp_sum = llm.invoke([HumanMessage(content=prompt_summary)])
+            state["summary"] = _normalize_llm_content(resp_sum.content)
 
         await _send_ws_message(
             task_id,
